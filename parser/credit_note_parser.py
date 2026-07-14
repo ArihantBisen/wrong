@@ -7,7 +7,7 @@ Flow:
   1. Read PDF from local disk
   2. Extract raw text with pdfplumber
   3. No IRN check — credit notes are NOT required to be GST e-invoices
-  4. PAN check (soft) — vendor PAN must be present in text
+  4. PAN check — vendor PAN must be explicitly printed OR embedded in a valid GSTIN
   5. Determine CGST/SGST vs IGST from GSTINs found
   6. Claude Haiku — extract CN fields including original invoice reference number
   7. Return structured result
@@ -52,14 +52,17 @@ GST_STATE_CODES = {
 }
 
 GSTIN_RE = re.compile(r'(?<![A-Z0-9])([0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z])(?![A-Z0-9])')
-PAN_RE   = re.compile(r'(?<![A-Z])([A-Z]{5}[0-9]{4}[A-Z])(?![A-Z0-9])')
 
 
 def extract_gstins_and_pans(text: str):
+    """
+    Derive PANs only from GSTINs — direct whole-document PAN string matching
+    is too loose (any ABCDE1234F-shaped token, e.g. an invoice number, would
+    match), so the expected PAN is checked directly against the text separately.
+    """
     upper  = text.upper()
     gstins = set(GSTIN_RE.findall(upper))
     pans   = {g[2:12] for g in gstins}
-    pans.update(PAN_RE.findall(upper))
     return gstins, pans
 
 
@@ -149,18 +152,26 @@ def process_credit_note(
     if not pdf_text.strip():
         return _error("PDF appears to be empty or scanned — no text could be extracted")
 
-    # ── PAN check (soft) ───────────────────────────────────────────────────────
+    # ── PAN check — explicit text OR embedded in valid GSTIN ──────────────────
     gstins, pans = extract_gstins_and_pans(pdf_text)
     expected_pan = vendor_pan.strip().upper()
 
-    if expected_pan not in pans:
+    vendor_gstin_matches = [g for g in gstins if g[2:12] == expected_pan]
+
+    pan_in_text = bool(re.search(
+        r'(?<![A-Z])' + re.escape(expected_pan) + r'(?![A-Z0-9])',
+        pdf_text.upper()
+    ))
+
+    if not pan_in_text and not vendor_gstin_matches:
         return _reject(
-            f"PAN mismatch. Your registered PAN ({expected_pan}) was not found in this credit note. "
+            f"PAN mismatch. Your registered PAN ({expected_pan}) was not found in this credit note "
+            f"(checked both explicit PAN text and GSTIN). "
             f"Please ensure you are uploading your own company's credit note."
         )
 
     # ── Tax type from GSTINs ───────────────────────────────────────────────────
-    vendor_gstin = next((g for g in gstins if g[2:12] == expected_pan), None)
+    vendor_gstin = vendor_gstin_matches[0] if vendor_gstin_matches else None
     sboss_gstin  = next((g for g in gstins if g[2:12] == SBOSS_PAN), None)
     tax_type     = determine_tax_type(vendor_gstin, sboss_gstin)
 
@@ -191,7 +202,10 @@ def process_credit_note(
                 ),
             }],
         )
-        raw_response = message.content[0].text.strip()
+        text_block = next((b for b in message.content if hasattr(b, 'text')), None)
+        if not text_block:
+            return _error("Claude returned no text content")
+        raw_response = text_block.text.strip()
     except Exception as e:
         return _error(f"Claude extraction failed: {str(e)}")
 
