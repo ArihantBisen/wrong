@@ -6,11 +6,12 @@ Flow:
   2. Extract raw text with pdfplumber
   3. Bill guard — confirm IRN exists (proves it's a GST e-invoice)
   4. Extract all GSTINs from invoice → derive PANs from them (chars 3-12)
-  5. PAN check — vendor's registered PAN must be present (directly or via GSTIN)
+  5. PAN check (dual) — vendor PAN must be embedded in a valid GSTIN AND/OR explicitly printed
   6. Determine CGST/SGST vs IGST using state codes from vendor + SBOSS GSTINs
   7. Claude Haiku — structured extraction with tax-type hint
-  8. Validate Claude output (tax type consistency check)
-  9. Return structured result
+  8. Credit note guard — reject if Claude detects a credit note
+  9. Validate Claude output (tax type consistency check)
+  10. Return structured result
 
 Official GST rule: GSTIN chars 3-12 (0-indexed: 2-11) = PAN of the entity.
 Source: GST portal / CBIC. Valid for all normal taxpayers (companies, LLPs, firms, proprietors).
@@ -80,7 +81,6 @@ GST_STATE_CODES = {
 GSTIN_RE = re.compile(
     r'(?<![A-Z0-9])([0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z])(?![A-Z0-9])'
 )
-PAN_RE = re.compile(r'(?<![A-Z])([A-Z]{5}[0-9]{4}[A-Z])(?![A-Z0-9])')
 
 
 # ── IRN finder (handles split-line IRNs) ───────────────────────────────────────
@@ -124,17 +124,13 @@ def find_irn(text: str) -> str | None:
 def extract_gstins_and_pans(text: str) -> tuple[set, set]:
     """
     Extract all GSTINs from text.
-    Derive PANs from GSTINs (official rule: chars 3-12, 0-indexed: 2-11).
-    Also pick up any directly printed PANs.
-    Returns (gstins, pans) both as uppercase sets.
+    Derive PANs only from GSTINs — direct whole-document PAN string matching
+    is too loose (any ABCDE1234F-shaped token, e.g. an invoice number, would
+    match), so the expected PAN is checked directly against the text separately.
     """
     upper = text.upper()
     gstins = set(GSTIN_RE.findall(upper))
-    pans = set()
-    for gstin in gstins:
-        pans.add(gstin[2:12])  # official PAN position in GSTIN
-    direct_pans = PAN_RE.findall(upper)
-    pans.update(direct_pans)
+    pans = {gstin[2:12] for gstin in gstins}  # official PAN position in GSTIN
     return gstins, pans
 
 
@@ -245,22 +241,24 @@ def process_invoice(
     gstins_in_pdf, pans_in_pdf = extract_gstins_and_pans(pdf_text)
     expected_pan = vendor_pan.strip().upper()
 
-    # ── Step 5: PAN check ─────────────────────────────────────────────────────
-    if expected_pan not in pans_in_pdf:
+    # ── Step 5: PAN check — explicit text OR embedded in valid GSTIN ──────────
+    vendor_gstin_matches = [g for g in gstins_in_pdf if g[2:12] == expected_pan]
+
+    pan_in_text = bool(re.search(
+        r'(?<![A-Z])' + re.escape(expected_pan) + r'(?![A-Z0-9])',
+        pdf_text.upper()
+    ))
+
+    if not pan_in_text and not vendor_gstin_matches:
         return _reject(
-            f"PAN mismatch. Your registered PAN ({expected_pan}) was not found in this invoice. "
+            f"PAN mismatch. Your registered PAN ({expected_pan}) was not found in this invoice "
+            f"(checked both explicit PAN text and GSTIN). "
             f"Please ensure you are uploading your own company's invoice."
         )
 
     # ── Step 6: Determine tax type from GSTINs ────────────────────────────────
-    vendor_gstin = None
-    sboss_gstin  = None
-    for gstin in gstins_in_pdf:
-        pan = gstin[2:12]
-        if pan == expected_pan:
-            vendor_gstin = gstin
-        if pan == SBOSS_PAN:
-            sboss_gstin = gstin
+    vendor_gstin = vendor_gstin_matches[0] if vendor_gstin_matches else None
+    sboss_gstin  = next((g for g in gstins_in_pdf if g[2:12] == SBOSS_PAN), None)
 
     tax_type = determine_tax_type(vendor_gstin, sboss_gstin)
 
@@ -295,7 +293,10 @@ def process_invoice(
                 }
             ],
         )
-        raw_response = message.content[0].text.strip()
+        text_block = next((b for b in message.content if hasattr(b, 'text')), None)
+        if not text_block:
+            return _error("Claude returned no text content")
+        raw_response = text_block.text.strip()
     except Exception as e:
         return _error(f"Claude extraction failed: {str(e)}")
 
@@ -315,6 +316,13 @@ def process_invoice(
         return _reject(
             "Could not extract invoice number from this PDF. "
             "Please ensure this is a valid GST e-invoice."
+        )
+
+    # ── Step 9b: Credit note guard ─────────────────────────────────────────────
+    if (data.get("invoice_type") or "").strip().lower() == "credit_note":
+        return _reject(
+            "This appears to be a Credit Note, not a regular invoice. "
+            "Please use the 'Upload Credit Notes' page to upload credit notes."
         )
 
     # ── Step 10: Tax type validation ──────────────────────────────────────────
