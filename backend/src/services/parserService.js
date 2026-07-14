@@ -36,6 +36,29 @@ export async function callParser({
   return response.data
 }
 
+function calculateShortExcess(result) {
+  const taxable  = Number(result.taxable_amount ?? 0)
+  const cgst     = Number(result.cgst_amount    ?? 0)
+  const sgst     = Number(result.sgst_amount    ?? 0)
+  const igst     = Number(result.igst_amount    ?? 0)
+  const invValue = Number(result.invoice_value  ?? 0)
+
+  if (!taxable || !invValue) return { shortAmount: null, excessAmount: null }
+
+  const calculated = taxable + cgst + sgst + igst
+  const diff       = Math.round((invValue - calculated) * 100) / 100  // 2 decimal places
+
+  if (diff > 0) {
+    // Invoice value > calculated → vendor billed more → SHORT (we owe less than billed)
+    return { shortAmount: diff, excessAmount: null }
+  } else if (diff < 0) {
+    // Invoice value < calculated → vendor billed less → EXCESS (we owe more than billed)
+    return { shortAmount: null, excessAmount: Math.abs(diff) }
+  }
+
+  return { shortAmount: null, excessAmount: null }
+}
+
 /**
  * Process a single invoice record through the parser and update the DB.
  */
@@ -223,6 +246,8 @@ export async function processInvoice(
 
         invoiceValue:
           result.invoice_value,
+
+        ...calculateShortExcess(result),
 
         description:
           result.description
