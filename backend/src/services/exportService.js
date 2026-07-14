@@ -357,6 +357,8 @@ export function buildExportRows(invoices, creditNotes) {
 
       sbossName: inv.sbossName ?? '-',
 
+      sbossGstin: inv.sbossGstin ?? '-',
+
       sbossState: inv.sbossState ?? '-',
 
       sbossAddress: inv.sbossAddress ?? '-',
@@ -447,6 +449,8 @@ invoiceValue:
 
         sbossName: '-',
 
+        sbossGstin: '-',
+
         sbossState: '-',
 
         sbossAddress: '-',
@@ -534,6 +538,8 @@ igst:
       partnerAddress: '-',
 
       sbossName: '-',
+
+      sbossGstin: '-',
 
       sbossState: '-',
 
@@ -697,6 +703,12 @@ igst:
     {
       header: 'SBOSS Name',
       key: 'sbossName',
+      width: 22
+    },
+
+    {
+      header: 'SBOSS GSTIN',
+      key: 'sbossGstin',
       width: 22
     },
 
