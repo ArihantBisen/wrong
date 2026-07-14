@@ -87,42 +87,37 @@ PAN_RE = re.compile(r'(?<![A-Z])([A-Z]{5}[0-9]{4}[A-Z])(?![A-Z0-9])')
 def find_irn(text: str) -> str | None:
     """
     GST e-invoices have a 64-character hex IRN.
-    Handles:
-      1. Full 64-char IRN on one line
-      2. IRN near label — strip whitespace AND hyphens (PDF line-break hyphen)
-      3. Adjacent hex tokens separated by whitespace/hyphens totalling 64 chars
+    Handles single-line and split IRNs across all known vendor formats.
+    Filters out purely-numeric tokens (Ack No etc.) by requiring at least one a-f letter.
     """
+    def find_64_pair(search_text: str) -> str | None:
+        # Only tokens with at least one hex letter — filters out pure-numeric Ack No
+        tokens = [t for t in re.finditer(r'[0-9a-fA-F]{8,}', search_text)
+                  if re.search(r'[a-fA-F]', t.group())]
+        for i in range(len(tokens)):
+            seg1 = tokens[i].group()
+            if len(seg1) >= 64:
+                continue
+            for j in range(i + 1, min(i + 5, len(tokens))):
+                seg2 = tokens[j].group()
+                if len(seg1) + len(seg2) == 64:
+                    return (seg1 + seg2).lower()
+        return None
+
     # 1. Full 64-char IRN on one line
     m = re.search(r'(?<![0-9a-fA-F])([0-9a-fA-F]{64})(?![0-9a-fA-F])', text)
     if m:
         return m.group(1).lower()
 
-    # 2. Find near "IRN" label — strip whitespace AND hyphens
-    irn_label = re.search(
-        r'IRN\s*[:\-=]?\s*([0-9a-fA-F\s\-]{60,140})',
-        text,
-        re.IGNORECASE
-    )
+    # 2. Search in 300 chars near IRN label
+    irn_label = re.search(r'IRN\b', text, re.IGNORECASE)
     if irn_label:
-        candidate = re.sub(r'[\s\-]+', '', irn_label.group(1))
-        if len(candidate) >= 64:
-            candidate = candidate[:64]
-            if re.fullmatch(r'[0-9a-fA-F]{64}', candidate):
-                return candidate.lower()
+        result = find_64_pair(text[irn_label.end():irn_label.end() + 300])
+        if result:
+            return result
 
-    # 3. Adjacent hex tokens with only whitespace or hyphens between, totalling 64 chars
-    #    Filter to tokens containing at least one a-f letter (excludes pure-numeric Ack No)
-    hex_tokens = [m for m in re.finditer(r'[0-9a-fA-F]{8,}', text)
-                  if re.search(r'[a-fA-F]', m.group())]
-    for i in range(len(hex_tokens) - 1):
-        seg1 = hex_tokens[i].group()
-        seg2 = hex_tokens[i + 1].group()
-        if len(seg1) + len(seg2) == 64:
-            between = text[hex_tokens[i].end():hex_tokens[i + 1].start()]
-            if not re.search(r'[^\s\-]', between):
-                return (seg1 + seg2).lower()
-
-    return None
+    # 3. Full text fallback
+    return find_64_pair(text)
 
 
 # ── GSTIN + PAN extraction ─────────────────────────────────────────────────────
